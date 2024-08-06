@@ -7,13 +7,19 @@ import numpy as np
 import scipy.io as sio
 import torch.nn as nn
 import torch.optim as optim
-import math
-from numpy.fft import fftshift, ifftshift, fft2
-# from sigpy import linop
-# import sigpy as sp
+import torch.nn.functional as F
+import torchaudio.transforms as T
+from scipy import signal
+# from dce import DCE
 
-from dce import DCE
-import dce
+def check_for_nan(x, name, index):
+    if torch.isnan(x).any():
+        print(f"Nan values found in {name} at index {index}")
+
+
+def check_for_inf(x, name, index):
+    if torch.isinf(x).any():
+        print(f"Inf values found in {name} at index {index}")
 
 
 # TEST - ksp to image space , matching jo's code
@@ -24,6 +30,7 @@ def fft2c(x, axes=(-2, -1), norm='ortho'):
     # center the kspace
     x = torch.fft.fftshift(x, dim=axes)
     return x
+
 
 # TEST - image to kspace
 def ifft2c(x, axes=(-2, -1), norm='ortho'):
@@ -44,16 +51,12 @@ class DCE(nn.Module):
                  Cp,
                  M0=5.0,
                  R1CA=4.30,
-                 FA=15.,
-                 TR=0.006,
-                 x_iscomplex=True,
-                 device=torch.device('cuda')):
+                 FA=10.,
+                 TR=4.87E-3,
+                 device=torch.device('cpu')):
         super(DCE, self).__init__()
 
-        if x_iscomplex:
-            self.ishape = list(ishape[:-1])
-        else:
-            self.ishape = list(ishape)
+        self.ishape = list(ishape)
 
         self.sample_time = torch.tensor(np.squeeze(sample_time), dtype=torch.float32, device=device)
         self.sig_baseline = sig_baseline
@@ -72,7 +75,6 @@ class DCE(nn.Module):
         self.M0 = topM0 / bottomM0
         self.M0_trans = self.M0 * torch.sin(self.FA_radian)
         self.M_steady = self.M0_trans * (1 - E1) / (1 - E1 * torch.cos(self.FA_radian))
-
         # Cp_DCE = dce.arterial_input_function(sample_time)
 
         # read in breast sim aif, resize for shape [numpoints, ]
@@ -114,85 +116,95 @@ class DCE(nn.Module):
         # Using PyTorch's conv1d with appropriate padding and kernel size
         return torch.conv1d(x.unsqueeze(0), y.unsqueeze(0), padding=(len(y) - 1) // 2)
 
-
     # equation 1 in the paper
     def _param_to_conc_patlak(self, x):
-        # t1_idx = torch.nonzero(self.sample_time)
-        # t1 = self.sample_time[t1_idx]
+        t_end = self.sample_time[-1]  # 150 s --> 2.5 min
+        step_size = 0.1  # s
 
-        # convert sample time to every 1 second
-        t_end = self.sample_time[-1]
-        step_size = 0.1
-        t_step = torch.arange(0, t_end + step_size, step=step_size, dtype=torch.float32)
+        # multiply the aif by all the tissues- assume same aif
+        t_samp = torch.arange(0, t_end + step_size, step_size)
 
-        dt = torch.diff(t_step, dim=0)
-        K_time = torch.cumsum(self.Cp, dim=0) * dt[-1]  # convolution - size: [22]
+        t1_idx = torch.nonzero(t_samp)
+        t1 = t_samp[t1_idx]
+        dt = torch.diff(t1, dim=0)
 
-        mult = torch.stack((K_time, self.Cp), 1)  # [22, 2]
+        aifci = pchip_interpolate(self.sample_time, self.Cp, t_samp)
+        aifci_tens = torch.tensor(aifci, dtype=torch.float32)
+
+        K_time = torch.cumsum(aifci_tens, dim=0) * dt[-1]
+        mult = torch.stack((K_time, aifci_tens), 1)  # [1502, 2]
 
         xr = torch.reshape(x, (self.ishape[0], np.prod(self.ishape[1:])))  # [2, 102400 (320*320)]
-        yr = torch.matmul(mult, xr)  # [22, 102400]
+        yr = torch.matmul(mult, xr)  # [1502, 102400]
 
-        oshape = [len(self.sample_time)] + self.ishape[1:]  # [22, 1, 320, 320]
-        yr = torch.reshape(yr, tuple(oshape))  # reshape yr to [22, 1, 320, 320 ] --> concentration curve
-        return yr
+        oshape = [len(t_samp)] + self.ishape[1:]  # [1502, 1, 320, 320]
+        yr = torch.reshape(yr, tuple(oshape))  # reshape yr to [1502, 1, 320, 320 ] --> concentration curve
+
+        # Create a boolean mask for original sampling points
+        logIdx = torch.zeros(len(t_samp), dtype=torch.bool)
+        for i, t in enumerate(self.sample_time):
+            closest_idx = (torch.abs(t_samp - t)).argmin().item()
+            logIdx[closest_idx] = True
+
+        conc = yr[logIdx, ...]  # back to shape [number of original sampling points, 320, 320]
+        return conc
 
     def _param_to_conc_tcm(self, x):
         # sample time to every 1 second with step_size
         t_end = self.sample_time[-1]  # 150 s --> 2.5 min
-        step_size = 1  # s
+        step_size = 0.5  # s
 
         # multiply the aif by all the tissues- assume same aif
         t_samp = np.arange(0, t_end + step_size, step_size)
+
+        # t_samp = self.sample_time
         aifci = pchip_interpolate(self.sample_time, self.Cp, t_samp)
         aifci_tens = torch.tensor(aifci, dtype=torch.float32)
+
+        # # Add delay to AIF
+        # delay_samples = int(4 / step_size)  # -- seconds delay
+        # aifci_delayed = np.roll(aifci, delay_samples)
+        # aifci_delayed[:delay_samples] = 0  # zero out the initial values
+        #
+        # aifci_tens = torch.tensor(aifci_delayed, dtype=torch.float32)
 
         aif_map = aifci_tens.unsqueeze(-1).unsqueeze(-1).repeat(1, 320, 320)
         aif_map = torch.unsqueeze(aif_map, dim=1)
 
-        # # initialize x with 1E-8 so not zeros, make it no grad so the operation is not differentiable
-        x_check = x.clone()
-        with torch.no_grad():
-            if torch.all(x_check == 0):
-                x = x_check.fill_(1E-8)
-
         # x should have size [4, 1, x, y]
-        ve = x[0, ...]
-        vp = x[1, ...]
-        fp = x[2, ...]
-        PS = x[3, ...]
+        ve = abs(x[0, ...])
+        vp = abs(x[1, ...])
+        fp = abs(x[2, ...])
+        PS = abs(x[3, ...])
 
         Ce = torch.zeros_like(aif_map)  # [t_sampling_points, 1, x, y]
         cp = torch.zeros_like(aif_map)
 
+        epsilon = 1E-12
         for i in range(1, len(t_samp)):
             dt = t_samp[i] - t_samp[i - 1]
 
             Ce_prev = Ce[i - 1].clone()
             cp_prev = cp[i - 1].clone()
 
-            d_cp = fp * aifci_tens[i - 1] + (PS * Ce_prev) - (fp + PS) * cp_prev
-            d_ce = PS * cp_prev - PS * Ce_prev
+            d_cp = (fp * aifci_tens[i - 1] + (PS * Ce_prev) - (fp + PS) * cp_prev)
+            d_ce = (PS * cp_prev - PS * Ce_prev)
 
             dcp_dt = d_cp * dt
             dce_dt = d_ce * dt
 
-            # set break here if ve < 1E-8 then set ce[i] = ce_prev, same with vp
-            if torch.all(vp < 1E-8):
-                cp[i] = cp_prev
+            # der_vp = torch.where(vp != 0, dcp_dt/vp, torch.ones_like(dcp_dt)*epsilon)
+            der_vp = torch.where(vp == 0, torch.zeros_like(dcp_dt), dcp_dt / vp)
+            cp[i] = cp_prev + der_vp
 
-            if torch.all(ve < 1E-8):
-                Ce[i] = Ce_prev
+            # der_ve = torch.where(ve != 0, dce_dt/ve, torch.ones_like(dce_dt)*epsilon)
+            der_ve = torch.where(ve == 0, torch.zeros_like(dce_dt), dce_dt / ve)
+            Ce[i] = Ce_prev + der_ve
 
-            if torch.any(vp > 1E-8):
-                der_vp = torch.div(dcp_dt, vp)
-                cp[i] = cp_prev + der_vp
+        vp_clone = vp.clone().repeat(len(t_samp), 1, 1, 1)
+        ve_clone = ve.clone().repeat(len(t_samp), 1, 1, 1)
 
-            if torch.any(ve > 1E-8):
-                der_ve = torch.div(dce_dt, ve)
-                Ce[i] = Ce_prev + der_ve
-
-        conc = vp.repeat(len(t_samp), 1, 1, 1) * cp + ve.repeat(len(t_samp), 1, 1, 1) * Ce
+        conc = (vp_clone * cp + ve_clone * Ce)
 
         # bool log indices where sampling occurred
         logIdx = np.zeros(len(t_samp))
@@ -206,21 +218,89 @@ class DCE(nn.Module):
         logIdx = logIdx.astype(bool)
 
         conc = conc[logIdx, ...]  # back to shape [22, 320, 320]
-
-        # # Check for NaN values in the final concentration tensor and replace them with zeros
-        conc = torch.where(torch.isnan(conc), torch.zeros_like(conc), conc)
-
         return conc
 
-    def _param_to_conc_tcm_biexponent(self, x):
-        # This one is most promising - just need to find the right convolve function
-        t = self.sample_time
+    def fft_convolve_time_only_torch(self, aif_map, kernel):
+        # Initialize the result tensor with the appropriate shape
+        result_shape = (aif_map.shape[0] + kernel.shape[0] - 1, aif_map.shape[1], aif_map.shape[2])
+        conv_result = torch.zeros(result_shape, dtype=torch.float32, device=aif_map.device)
 
-        # # initialize x with 1E-8 so not zeros, make it no grad so the operation is not differentiable
-        x_check = x.clone()
-        with torch.no_grad():
-            if torch.all(x_check == 0):
-                x = x_check.fill_(1E-8)
+        # Perform 1D convolution along the time dimension for each spatial position
+        for i in range(aif_map.shape[1]):
+            for j in range(aif_map.shape[2]):
+                # Extract the 1D signals
+                aif_1d = aif_map[:, i, j].unsqueeze(0).unsqueeze(0)  # shape [1, 1, T]
+                kernel_1d = kernel[:, i, j].flip(0).unsqueeze(0).unsqueeze(0)  # shape [1, 1, K]
+
+                # Perform the 1D convolution
+                conv_1d = F.conv1d(aif_1d, kernel_1d, padding=kernel_1d.shape[-1] - 1)
+
+                # Assign the result to the appropriate slice of the result tensor
+                conv_result[:, i, j] = conv_1d.squeeze(0).squeeze(0)[:result_shape[0]]
+
+        # The resulting tensor shape is [t_samp*2 - 1, 320, 320]
+        return conv_result
+
+    def fft_convolve_time_only_batched(self, aif_map, kernel):
+        # Get the shapes
+        T, H, W = aif_map.shape
+        K = kernel.shape[0]
+
+        # Reshape aif_map to (H*W, 1, T)
+        aif_map_batched = aif_map.permute(1, 2, 0).reshape(H * W, 1, T)
+
+        # Reshape kernel to (H*W, 1, K)
+        kernel_batched = kernel.permute(1, 2, 0).reshape(H * W, 1, K).flip(-1)
+
+        # Perform the 1D convolution for each batch separately
+        conv_result_batched = torch.cat(
+            [F.conv1d(aif_map_batched[i:i + 1], kernel_batched[i:i + 1], padding=K - 1) for i in range(H * W)], dim=0)
+
+        # Reshape the result back to (T+K-1, H, W)
+        conv_result = conv_result_batched.reshape(H, W, -1).permute(2, 0, 1)
+
+        # Return the result
+        return conv_result[:T + K - 1, :, :]
+
+    def fft_convolve(self, A, kernel):
+        # Get the shapes
+        T_sampling, H, W = kernel.shape
+
+        # Zero-pad the AIF and kernel to the length of T_sampling * 2 - 1
+        padded_length = 2 * T_sampling - 1
+        aif_padded = torch.zeros(padded_length, device=A.device)
+        kernel_padded = torch.zeros((padded_length, H, W), device=A.device)
+
+        aif_padded[:T_sampling] = A
+        kernel_padded[:T_sampling, :, :] = kernel
+
+        # Perform FFT on the zero-padded AIF and Kernel
+        aif_fft = torch.fft.fft(aif_padded)
+        kernel_fft = torch.fft.fft(kernel_padded, dim=0)
+
+        # Element-wise multiplication in the frequency domain
+        result_fft = aif_fft[:, None, None] * kernel_fft
+
+        # Perform inverse FFT to get the convolution result
+        conv_result = torch.fft.ifft(result_fft, dim=0).real
+        return conv_result
+
+    def _param_to_conc_tcm_SnB(self, x):
+        t_end = self.sample_time[-1]  # 150 s --> 2.5 min
+        step_size = 0.1  # s
+
+        # multiply the aif by all the tissues- assume same aif
+        t_samp = torch.arange(0, t_end + step_size, step_size)
+        aifci = pchip_interpolate(self.sample_time, self.Cp, t_samp)
+
+        # Add delay to AIF
+        delay_samples = int(3 / step_size)  # 3 seconds delay
+        aifci_delayed = np.roll(aifci, delay_samples)
+        aifci_delayed[:delay_samples] = 0  # zero out the initial values
+
+        aifci_tens = torch.tensor(aifci_delayed, dtype=torch.float32)
+        t_map = t_samp.unsqueeze(-1).unsqueeze(-1).repeat(1, 320, 320)
+        aifMap = aifci_tens.unsqueeze(-1).unsqueeze(-1).repeat(1, 320, 320)
 
         # x should have size [4, 1, x, y]
         ve = x[0, ...]
@@ -228,102 +308,77 @@ class DCE(nn.Module):
         fp = x[2, ...]
         ps = x[3, ...]
 
-        E = ps / (ps + fp)
-        e = ve / (vp + ve)
-        Ee = E * e
+        Te = ve / ps
+        T = (vp + ve) / fp
+        Tc = vp / fp
 
-        # tau_mult = (E - Ee + e) / (2. * E)
-        # tau_quad = 1 - 4 * (Ee * (1 - E) * (1 - e)) / (E - Ee + e) ** 2
-        #
-        # tau_plus = tau_mult * (1 + torch.sqrt(tau_quad))
-        # tau_minus = tau_mult * (1 - torch.sqrt(tau_quad))
-        #
-        # F_plus = fp * ((tau_plus - 1.) / (tau_plus - tau_minus))
-        # F_minus = -fp * ((tau_minus - 1.) / (tau_plus - tau_minus))
-        #
-        # K_plus = fp / ((vp + ve) * tau_minus)
-        # K_minus = fp / ((vp + ve) * tau_plus)
-        #
-        # R_t = F_plus * torch.exp(-t*K_plus) + F_minus * torch.exp(-t*K_minus)
+        Te[torch.isnan(Te)] = 0
+        T[torch.isnan(T)] = 0
+        Tc[torch.isnan(Tc)] = 0
 
-        tau_pluss = (E - Ee + e) / (2. * E) * (1 + torch.sqrt(1 - 4 * (Ee * (1 - E) * (1 - e)) / (E - Ee + e) ** 2))
-        tau_minus = (E - Ee + e) / (2. * E) * (1 - torch.sqrt(1 - 4 * (Ee * (1 - E) * (1 - e)) / (E - Ee + e) ** 2))
+        theta_plus = ((T + Te) + torch.sqrt((T + Te) ** 2 - 4 * Tc * Te)) / (2 * Tc * Te)
+        theta_minus = ((T + Te) - torch.sqrt((T + Te) ** 2 - 4 * Tc * Te)) / (2 * Tc * Te)
 
-        F_pluss = fp * (tau_pluss - 1.) / (tau_pluss - tau_minus)
-        F_minus = -fp * (tau_minus - 1.) / (tau_pluss - tau_minus)
+        theta_plus[torch.isnan(theta_plus)] = 0
+        theta_minus[torch.isnan(theta_minus)] = 0
 
-        K_pluss = fp / ((vp + ve) * tau_minus)
-        K_minus = fp / ((vp + ve) * tau_pluss)
+        he = theta_plus * theta_minus * (
+                (torch.exp(-t_map * theta_minus) - torch.exp(
+                    -t_map * theta_plus)) /
+                (theta_plus - theta_minus))
 
-        two_compartment_model = F_pluss * torch.exp(-t * K_pluss) + F_minus * torch.exp(-t * K_minus)
-        #tcm = math.NP.convolve(R_t, self.Cp, self.sample_time) - the original line of code
-        tcm = self.convolve(R_t, self.Cp)
-        return tcm
+        hp = theta_plus * theta_minus * (
+                ((1 - Te * theta_minus) * torch.exp(
+                    -t_map * theta_minus) +
+                 (Te * theta_plus - 1) * torch.exp(
+                            -t_map * theta_plus)) /
+                (theta_plus - theta_minus))
 
-    def _param_to_conc_tcm_sys_of_eqns(self, x):
-        # this method may not work because of the system of equations - not a simple matrix equation like you thought
-        # sample time to every 1 second with step_size
-        t_end = self.sample_time[-1]  # 150 s --> 2.5 min
-        step_size = 1  # s
+        he[torch.isnan(he)] = 0
+        hp[torch.isnan(hp)] = 0
 
-        # multiply the aif by all the tissues- assume same aif
-        t_samp = np.arange(0, t_end + step_size, step_size)
-        aifci = pchip_interpolate(self.sample_time, self.Cp, t_samp)
-        aifci_tens = torch.tensor(aifci, dtype=torch.float32)
+        ce = self.fft_convolve_time_only_batched(aifMap, he) * step_size
+        cp = self.fft_convolve_time_only_batched(aifMap, hp) * step_size
 
-        aif_map = aifci_tens.unsqueeze(-1).unsqueeze(-1).repeat(1, 320, 320)
-        aif_map = torch.unsqueeze(aif_map, dim=1)
+        # check shapes here
+        conc = vp * cp[:len(t_samp), ...] + ve * ce[:len(t_samp), ...]
+        # conc = vp * cp + ve * ce
 
-        x_check = x.clone()
-        with torch.no_grad():
-            if torch.all(x_check == 0):
-                x = x_check.fill_(1E-8)
+        # bool log indices where sampling occurred
+        logIdx = np.zeros(len(t_samp))
+        start_idx = 0
+        for i in range(len(self.sample_time)):
+            for j in range(start_idx, len(t_samp)):
+                if self.sample_time[i] <= t_samp[j]:
+                    logIdx[j] = 1
+                    start_idx = j
+                    break
+        logIdx = logIdx.astype(bool)
 
-        # x should have size [4, 1, x, y]
-        ve = x[0, ...]
-        vp = x[1, ...]
-        Fp = x[2, ...]
-        PS = x[3, ...]
+        conc = conc[logIdx, ...]
+        conc = conc.unsqueeze(1)
+        return conc
 
-        alpha = (PS * Fp) / (ve * vp)
-        beta = ((Fp * ve) / ((ve + vp) * PS)) + 1 / (ve + vp)
-        gamma = ((ve + vp) * PS * Fp) / (ve * vp)
-
-        B = torch.stack((alpha, beta, gamma, Fp), dim = 0) # [4, 1, 320, 320]
-        C = aifci
-
-        A = torch.linalg.solve(B, C)
-
-        # vp = (torch.square(Fp)) / (beta * gamma - alpha)
-        # ve = (gamma / alpha) - vp
-        # PS = (alpha * ve * vp) / Fp
-
-        return A
-
-
-    # shape of x should be [2, c, y, x]
     def forward(self, x):
         self._check_ishape(x)
 
-        # parameters (k_trans, v_p) to concentration
-        #CA = self._param_to_conc_tcm(x)
-        #A = self._param_to_conc_tcm_sys_of_eqns(x)
-        C = self._param_to_conc_tcm_biexponent(x)
-
-        # CA = self._param_to_conc_patlak(x_c)
+        # CA_dro = self._param_to_conc_tcm(x)
+        # CA = self._param_to_conc_tcm_SnB(x)
+        CA = self._param_to_conc_patlak(x)
 
         # concentration to MR signal - equation 2 in the paper
         E1CA = torch.exp(-self.TR * (self.R1 + self.R1CA * CA))
         CA_trans = self.M0_trans * (1 - E1CA) / (1 - E1CA * torch.cos(self.FA_radian))
 
-        sig = CA_trans + self.sig_baseline - self.M_steady
+        sig = CA_trans + (self.sig_baseline - self.M_steady)
         ksp = self.ifft2c(sig)
 
         return ksp
 
 
 ########################################################################################################################
-TCM = True
+TCM = False
+Undersampled = False
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -332,39 +387,35 @@ else:
 
 print(device)
 DIR = os.path.dirname(os.path.realpath(__file__))
-path = '../Breast Sim Pipeline'
+data = sio.loadmat('DRO_data/Malignant/Run3_BC.mat')
 
 # TODO:
-breast_img = sio.loadmat('breast_cart_img.mat')['IMG']
-# breast_img = sio.loadmat('breast_rad_img_full.mat')['undersamp_grog_img']
-
+breast_img = data['IMG']
 breast_img = np.transpose(breast_img, (2, 0, 1))
-breast_img = breast_img[:, None, ...]
+breast_img = abs(breast_img[:, None, ...])  # TOOK ABS() HERE
 print('> img shape: ', breast_img.shape)
 
-# only in radial case !
-# breast_img = np.flip(breast_img, axis = 2)
-# breast_img = np.flip(breast_img, axis = 3)
-
 breast_img_tens = torch.tensor(breast_img.copy(), dtype=torch.float32, device=device)
-t1_map = sio.loadmat('Breast_T1.mat')['T10']
+t1_map = data['T10']
 r1 = (1 / t1_map)
-
-aif = sio.loadmat('breast_aif.mat')['aif']
+aif = data['aif']
+concentration = data['cts']
 
 breast_ksp_tens = ifft2c(breast_img_tens)
+
+if Undersampled:
+    breast_ksp_tens[:, :, :, 1::2] = 0
+    breast_img_tens = abs(fft2c(breast_ksp_tens))  # magnitude
+
+# meas_tens = breast_ksp_tens
 meas_tens = breast_ksp_tens
-#meas_tens = breast_img_tens
 
 # reading time array straight from DRO - t is in seconds !!
-injection = sio.loadmat('t.mat')['t']
-# sample_time = np.concatenate((delay, injection))
-sample_time = injection
+sample_time = sio.loadmat('Data/t.mat')['t']
 print('> sample time: ', sample_time)
 
 # Baseline img
 x0 = breast_img_tens[0, ...]
-
 oshape = meas_tens.shape
 
 if TCM:
@@ -376,64 +427,81 @@ else:
     ishape = [2, 1] + list(oshape[-2:])  # extract the first two elements: [320, 320]
 
 olen = np.prod(oshape)
+
 x = torch.zeros(ishape, dtype=torch.float32,
                 requires_grad=True, device=device)
 
 # When using GT parmap from DRO
-# parmap = sio.loadmat('parMap.mat')['parMap']
-# parmap_tens = torch.tensor(parmap)
-# parmap_r = parmap_tens.permute(2, 0, 1)
-# parmap_u = parmap_r.unsqueeze(1)
-# x = parmap_u
+parmap = data['parMap']
+parmap_r = parmap.transpose(2, 0, 1)
+parmap_u = parmap_r[:, np.newaxis, ...]
+
+parmap_patlak = parmap[:, :, [3, 1]]
+parmap_tens = torch.tensor(parmap_patlak, dtype=torch.float32, requires_grad=True, device=device)
 
 # with torch.no_grad():
-#     x[0, ...] = 0.5
-#     x[1, ...] = 0.5
-#     x[2, ...] = 0.1
-#     x[3, ...] = 0.1
+# # #     # change so all the background values are 0
+#     parmap_tens[parmap_tens == 1E-8] = 0
+# #
+# #     # # create nonzero masks for ve and vp
+# #     # ve_nonzero = parmap_tens[0, 0, :, :] != 0
+# #     # vp_nonzero = parmap_tens[1, 0, :, :] != 0
+# #     #
+# #     #  # do inverse of ve and vp only where they don't have a 0 value
+# #     # parmap_tens[0, 0, :, :][ve_nonzero] = 1.0 / parmap_tens[0, 0, :, :][ve_nonzero]
+# #     # parmap_tens[1, 0, :, :][vp_nonzero] = 1.0 / parmap_tens[1, 0, :, :][vp_nonzero]
+# #
+#     x = parmap_tens
+# #     #
+# #     # x[0, ...] = 1E-4
+# #     # x[1, ...] = 1E-4
+# #     # x[2, ...] = 1E-4
+# #     # x[3, ...] = 1E-4
 
 model = DCE(ishape, sample_time, x0, r1, aif, device=device)
 lossf = nn.MSELoss(reduction='sum')
-# optimizer = optim.SGD([x], lr=0.001, momentum=0.9)
-optimizer = optim.Adam([x], lr=0.01, amsgrad=True)
-
-# put epoch stopper here when loss < 10e-4
-epsilon = 1e-4  # Set the desired difference threshold
-
+optimizer = optim.Adam([x], lr=0.005, amsgrad=True)
+#scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.001)
 torch.autograd.set_detect_anomaly(True)
-for epoch in range(50):
+
+for epoch in range(500):
     # performs forward pass of the model with the current parameters 'x'
     fwd = model(x)
+    check_for_nan(fwd, "Forward pass", epoch)
+
+    # # print parameters at a specific pixel region - where it would be brightest for that parameter based on GT maps
+    # ve_max = (x[0, 0, 270, 175])
+    # vp_max = (x[1, 0, 210, 82])
+    # fp_max = (x[2, 0, 270, 175])
+    # PS_max = (x[3, 0, 280, 90])
+    #
+    # print(f've: {ve_max}, vp: {vp_max}, fp: {fp_max}, PS: {PS_max} ')
 
     # computes the MSE loss between the estimated kspace and the measured kspace data
     res = lossf(torch.view_as_real(fwd), torch.view_as_real(meas_tens))
-    #res = lossf(fwd, meas_tens)  # in image space
-
-    # Stop the loop if the condition is met
-    if res.item() < epsilon:
-        print(f'Stopping at epoch {epoch} because the loss is less than {epsilon}')
-        break
+    #res = lossf(fwd, meas_tens)
+    check_for_nan(res, "loss", epoch)
 
     # clears the gradients accumulated in the previous iteration
     optimizer.zero_grad()
+    torch.autograd.set_detect_anomaly(True)
 
     # computes the gradients of the loss wrt the model parameters
     res.backward()
     optimizer.step()  # parameter update
+    # scheduler.step()
 
-    print('> epoch %3d loss %.9f' % (epoch, res.item() / olen))
-    #print('vp' )
+    print(f'Epoch {epoch}, Loss: {res.item()}, Learning Rate: {optimizer.param_groups[0]["lr"]}')
 
 x_np = x.cpu().detach().numpy()
-print(x_np.dtype)
 
+# fwd_img = fft2c(fwd)
+fwd_np = fwd.cpu().detach().numpy()
+print(x_np.dtype)
 meas_np = meas_tens.detach().numpy()
 
-outfilestr = 'TCM_test.h5'
-
+outfilestr = 'Patlak_BC3_fullsamp_1.h5'
 f = h5py.File(outfilestr, 'w')
 f.create_dataset('param', data=x_np)
-f.create_dataset('meas', data=meas_np)
-
+f.create_dataset('output', data=fwd_np)
 f.close()
-
